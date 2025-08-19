@@ -96,16 +96,18 @@ class HotReloadConfig:
     def _on_config_change(self):
         """配置变化处理：将新配置字段写回到现有实例，并触发回调"""
         try:
-            # 保存旧值用于对比
-            old_values = {
-                'ping_interval_sec': self._config_instance.ping_interval_sec,
-                'ping_timeout_sec': self._config_instance.ping_timeout_sec,
-                'max_concurrent_pings': self._config_instance.max_concurrent_pings,
-                'client_offline_threshold_sec': self._config_instance.client_offline_threshold_sec,
-                'log_level': self._config_instance.log_level,
-                'log_file': getattr(self._config_instance, 'log_file', ''),
-                'save_interval_sec': getattr(self._config_instance, 'save_interval_sec', 30),
+            # 保存旧值用于对比（添加白名单校验）
+            allowed_fields = {
+                'ping_interval_sec', 'ping_timeout_sec', 'max_concurrent_pings',
+                'client_offline_threshold_sec', 'log_level', 'log_file', 
+                'save_interval_sec', 'host', 'port', 'data_file',
+                'api_key', 'enable_api_auth', 'ping_stagger_sec'
             }
+            
+            old_values = {}
+            for field in allowed_fields:
+                if hasattr(self._config_instance, field):
+                    old_values[field] = getattr(self._config_instance, field)
             
             # 加载新配置（类方法返回新实例)
             cfg_cls = type(self._config_instance)
@@ -117,39 +119,50 @@ class HotReloadConfig:
                 logging.error(f"新配置验证失败，保持原配置: {validation_errors}")
                 return
             
-            # 将变化写回当前实例（保持引用不变）
-            for key in old_values.keys():
-                setattr(self._config_instance, key, getattr(new_cfg, key))
-            self._config_instance.host = new_cfg.host
-            self._config_instance.port = new_cfg.port
-            self._config_instance.data_file = new_cfg.data_file
-            
-            # 计算变化项
+            # 安全地将变化写回当前实例（仅允许的字段）
             changes = []
-            new_values = {
-                'ping_interval_sec': self._config_instance.ping_interval_sec,
-                'ping_timeout_sec': self._config_instance.ping_timeout_sec,
-                'max_concurrent_pings': self._config_instance.max_concurrent_pings,
-                'client_offline_threshold_sec': self._config_instance.client_offline_threshold_sec,
-                'log_level': self._config_instance.log_level,
-                'log_file': getattr(self._config_instance, 'log_file', ''),
-                'save_interval_sec': getattr(self._config_instance, 'save_interval_sec', 30),
-            }
-            for k, ov in old_values.items():
-                nv = new_values[k]
-                if ov != nv:
-                    changes.append(f"{k}: {ov} -> {nv}")
+            rollback_values = {}
             
-            if changes:
-                logging.info(f"配置变化: {', '.join(changes)}")
-                # 执行重载回调
-                for callback in self._reload_callbacks:
+            try:
+                for field in allowed_fields:
+                    if hasattr(new_cfg, field) and hasattr(self._config_instance, field):
+                        old_value = getattr(self._config_instance, field)
+                        new_value = getattr(new_cfg, field)
+                        
+                        if old_value != new_value:
+                            # 保存用于回滚
+                            rollback_values[field] = old_value
+                            # 应用新值
+                            setattr(self._config_instance, field, new_value)
+                            changes.append(f"{field}: {old_value} -> {new_value}")
+                
+                if changes:
+                    logging.info(f"配置变化: {', '.join(changes)}")
+                    
+                    # 执行重载回调
+                    callback_errors = []
+                    for i, callback in enumerate(self._reload_callbacks):
+                        try:
+                            callback()
+                        except Exception as e:
+                            callback_errors.append(f"回调{i}: {e}")
+                            logging.error(f"重载回调{i}执行失败: {e}")
+                    
+                    # 如果有回调失败，记录但不回滚配置
+                    if callback_errors:
+                        logging.warning(f"部分回调执行失败: {callback_errors}")
+                else:
+                    logging.debug("配置文件已更新，但没有实际变化")
+                    
+            except Exception as e:
+                # 配置更新失败，尝试回滚
+                logging.error(f"配置更新失败: {e}，尝试回滚")
+                for field, old_value in rollback_values.items():
                     try:
-                        callback()
-                    except Exception as e:
-                        logging.error(f"重载回调执行失败: {e}")
-            else:
-                logging.debug("配置文件已更新，但没有实际变化")
+                        setattr(self._config_instance, field, old_value)
+                    except Exception as rollback_error:
+                        logging.error(f"回滚字段 {field} 失败: {rollback_error}")
+                raise
                 
         except Exception as e:
             logging.error(f"配置重载失败: {e}")

@@ -95,7 +95,10 @@ def ping(host: str, timeout_sec: int = 3) -> bool:
 
 def validate_ip_address(ip: str) -> tuple[bool, str]:
     """
-    严格验证IP地址，允许常见的内网/覆盖网段
+    严格验证IP地址，排除特殊用途地址
+    
+    允许：标准IPv4/IPv6地址（包括私网地址）
+    排除：回环、链路本地、组播、保留、未指定地址
     
     Args:
         ip: IP地址字符串
@@ -171,7 +174,7 @@ def is_private_ip(ip: str) -> bool:
 
 def format_host_for_display(host: str, max_length: int = 15) -> str:
     """
-    格式化主机地址用于显示（避免过长的IPv6地址）
+    格式化主机地址用于显示（避免过长的IPv6地址，IPv6会添加方括号）
     
     Args:
         host: 主机地址
@@ -180,21 +183,32 @@ def format_host_for_display(host: str, max_length: int = 15) -> str:
     Returns:
         str: 格式化后的地址
     """
-    if len(host) <= max_length:
-        return host
-    
-    # 如果是IPv6地址，尝试简化显示
+    # 首先检查是否是IPv6地址
     try:
         import ipaddress
         ip_obj = ipaddress.ip_address(host)
         if ip_obj.version == 6:
             compressed = ip_obj.compressed
-            if len(compressed) <= max_length:
-                return compressed
-            # 截断显示
-            return compressed[:max_length-3] + "..."
+            # IPv6地址添加方括号以符合URL格式标准
+            formatted = f"[{compressed}]"
+            if len(formatted) <= max_length:
+                return formatted
+            # 如果太长，截断显示但保留方括号
+            if max_length > 6:  # 确保有足够空间显示 [...]
+                truncated = compressed[:max_length-6] + "..."
+                return f"[{truncated}]"
+            else:
+                return "[...]"
+        else:
+            # IPv4地址直接处理
+            if len(host) <= max_length:
+                return host
+            return host[:max_length-3] + "..."
     except ValueError:
-        pass
+        # 不是IP地址，可能是域名
+        if len(host) <= max_length:
+            return host
+        return host[:max_length-3] + "..."
     
     # 普通截断
     return host[:max_length-3] + "..."

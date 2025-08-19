@@ -1,7 +1,12 @@
 import atexit
 import logging
+import os
+import subprocess
+import sys
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Optional
 from urllib3.util.retry import Retry
 
@@ -9,12 +14,21 @@ import requests
 import requests.adapters
 from colorama import Fore, Style, init
 
-from .config import ClientConfig
-from .platform_utils import (
-    setup_logging, get_service_status, start_service, stop_service,
-    get_app_status, start_app, stop_app, ping, get_zerotier_ips,
-    get_interface_info
-)
+# 尝试相对导入，如果失败则使用绝对导入
+try:
+    from .config import ClientConfig
+    from .platform_utils import (
+        setup_logging, get_service_status, start_service, stop_service,
+        get_app_status, start_app, stop_app, ping, get_zerotier_ips,
+        get_interface_info
+    )
+except ImportError:
+    from client.config import ClientConfig
+    from client.platform_utils import (
+        setup_logging, get_service_status, start_service, stop_service,
+        get_app_status, start_app, stop_app, ping, get_zerotier_ips,
+        get_interface_info
+    )
 
 init(autoreset=True)
 
@@ -65,7 +79,7 @@ class ClientApp:
         # 注册退出清理函数（比 __del__ 更可靠）
         atexit.register(self._cleanup_session)
         
-        logging.info("ZeroTier Solver 客户端已启动")
+        logging.info("ZeroTier Reconnecter 客户端已启动")
 
     def _init_session(self):
         """初始化HTTP会话 - 增强资源管理"""
@@ -151,9 +165,15 @@ class ClientApp:
                     reason = f"请求过多({self._session_request_count})"
                 
                 logging.debug(f"重建HTTP会话: {reason}")
+                # 记录会话轮换统计信息（仅info级别，避免日志噪声）
+                if self._session_request_count >= self._session_max_requests:
+                    logging.info(f"HTTP会话已处理 {self._session_request_count} 个请求，重建以保持性能")
+                
                 self._init_session()
-            
-            # 增加请求计数
+    
+    def _record_request(self):
+        """记录请求使用（在实际发起请求后调用）"""
+        with self._session_lock:
             if self._session is not None:
                 self._session_request_count += 1
 
@@ -205,6 +225,7 @@ class ClientApp:
                 timeout=self._default_timeout,
                 headers=self._get_headers()
             )
+            self._record_request()  # 记录成功发起的请求
             if response.ok:
                 result = response.json()
                 message = f"已上报本机 IP: {ips}，服务端总客户端数: {result.get('total_clients', '未知')}"
@@ -219,8 +240,105 @@ class ClientApp:
             self.log_and_print(message, "ERROR", "red")
             return False
 
-    def check_server_health(self):
+    def start_local_server(self):
+        """启动本地服务端"""
+        print("—— 启动本地服务端 ——")
+        print("此功能将在后台启动 ZeroTier Reconnecter 服务端")
+        print()
+        
+        # 检查是否已有服务端在运行
+        if self.check_server_health(silent=True):
+            print(Fore.YELLOW + "检测到服务端已在运行中")
+            server_url = self.config.server_base
+            print(f"服务端地址: {server_url}")
+            
+            choice = input("是否重启服务端？ (y/N): ").strip().lower()
+            if choice != 'y':
+                print("操作已取消")
+                return
+            
+            print("正在重启服务端...")
+        else:
+            print("正在启动服务端...")
+        
+        try:
+            from pathlib import Path
+            
+            # 获取当前项目根目录
+            project_root = Path(__file__).parent.parent
+            main_py_path = project_root / "main.py"
+            
+            if not main_py_path.exists():
+                print(Fore.RED + "错误: 找不到 main.py 文件")
+                return
+            
+            # 构建启动命令
+            cmd = [sys.executable, str(main_py_path), "server"]
+            
+            print(f"执行命令: {' '.join(cmd)}")
+            print("服务端将在后台运行...")
+            
+            # 在新窗口中启动服务端（Windows）
+            if sys.platform == "win32":
+                # 使用 creationflags 在新窗口中启动，避免管道阻塞
+                subprocess.Popen(
+                    cmd,
+                    cwd=str(project_root),
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:
+                # Linux/Mac 使用正确的后台启动方式
+                # 使用shell=True配合nohup和重定向，或使用start_new_session
+                if hasattr(os, 'setsid'):
+                    # 使用进程组分离的方式（推荐）
+                    subprocess.Popen(
+                        cmd,
+                        cwd=str(project_root),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        preexec_fn=os.setsid
+                    )
+                else:
+                    # 回退到shell方式
+                    cmd_str = ' '.join(cmd) + ' >/dev/null 2>&1 &'
+                    subprocess.Popen(
+                        cmd_str,
+                        shell=True,
+                        cwd=str(project_root)
+                    )
+            
+            print(Fore.GREEN + "服务端启动命令已执行")
+            print("请等待几秒钟，然后检查服务端健康状态...")
+            
+            # 等待服务端启动
+            print("等待服务端启动", end="")
+            for i in range(5):
+                time.sleep(1)
+                print(".", end="", flush=True)
+            print()
+            
+            # 检查服务端是否成功启动
+            if self.check_server_health(silent=True):
+                print(Fore.GREEN + "✓ 服务端启动成功！")
+                print(f"服务端地址: {self.config.server_base}")
+                logging.info("用户启动本地服务端成功")
+            else:
+                print(Fore.YELLOW + "服务端可能正在启动中...")
+                print("请稍后手动检查服务端健康状态")
+                logging.warning("本地服务端启动后健康检查失败")
+                
+        except Exception as e:
+            message = f"启动服务端时发生错误: {e}"
+            print(Fore.RED + message)
+            logging.error(f"启动本地服务端异常: {e}")
+
+    def check_server_health(self, silent=False):
         """检查服务端健康状态"""
+        if not silent:
+            print("—— 检查服务端健康状态 ——")
+        
         self._ensure_session()
         
         try:
@@ -229,35 +347,44 @@ class ClientApp:
                 timeout=self._default_timeout,
                 headers=self._get_headers()
             )
+            self._record_request()  # 记录成功发起的请求
             if response.ok:
                 data = response.json()
                 clients_info = data.get('clients', {})
                 total = clients_info.get('total', 0) if isinstance(clients_info, dict) else clients_info
-                message = f"服务端正常，客户端数量: {total}"
-                print(Fore.GREEN + message)
+                
+                if not silent:
+                    message = f"服务端正常，客户端数量: {total}"
+                    print(Fore.GREEN + message)
+                
                 # 降低日志噪声：详细数据改为debug级别，info只记录摘要
-                logging.info(f"服务端健康检查成功，客户端数量: {total}")
+                if not silent:
+                    logging.info(f"服务端健康检查成功，客户端数量: {total}")
                 logging.debug(f"服务端详细状态: {data}")
                 return True
             else:
-                message = f"服务端健康检查失败: HTTP {response.status_code}"
-                print(Fore.RED + message)
-                logging.error(f"{message}, 响应: {response.text[:200]}")
+                if not silent:
+                    message = f"服务端健康检查失败: HTTP {response.status_code}"
+                    print(Fore.RED + message)
+                    logging.error(f"{message}, 响应: {response.text[:200]}")
                 return False
         except requests.exceptions.ConnectionError as e:
-            message = f"无法连接到服务端: 连接被拒绝"
-            print(Fore.RED + message)
-            logging.error(f"服务端连接错误: {e}")
+            if not silent:
+                message = f"无法连接到服务端: 连接被拒绝"
+                print(Fore.RED + message)
+                logging.error(f"服务端连接错误: {e}")
             return False
         except requests.exceptions.Timeout as e:
-            message = f"服务端连接超时"
-            print(Fore.RED + message)
-            logging.error(f"服务端超时: {e}")
+            if not silent:
+                message = f"服务端连接超时"
+                print(Fore.RED + message)
+                logging.error(f"服务端超时: {e}")
             return False
         except requests.exceptions.RequestException as e:
-            message = f"请求服务端时发生错误: {type(e).__name__}"
-            print(Fore.RED + message)
-            logging.error(f"服务端请求错误: {e}")
+            if not silent:
+                message = f"请求服务端时发生错误: {type(e).__name__}"
+                print(Fore.RED + message)
+                logging.error(f"服务端请求错误: {e}")
             return False
         except (ValueError, KeyError) as e:
             message = f"服务端响应格式错误"
@@ -280,14 +407,31 @@ class ClientApp:
                 timeout=5,
                 headers=self._get_headers()
             )
+            self._record_request()  # 记录成功发起的请求
             if response.ok:
                 clients = response.json()
                 print(Fore.CYAN + f"服务端客户端列表 (共 {len(clients)} 个):")
                 for ip, info in clients.items():
-                    last_seen = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(info.get('last_seen', 0)))
+                    last_seen_timestamp = info.get('last_seen', 0)
+                    if last_seen_timestamp > 0:
+                        last_seen = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_seen_timestamp))
+                    else:
+                        last_seen = "未上报"
+                    
                     last_ping_ok = info.get('last_ping_ok', False)
-                    ping_status = "在线" if last_ping_ok else "离线"
-                    color = Fore.GREEN if last_ping_ok else Fore.RED
+                    last_ping_at = info.get('last_ping_at', 0)
+                    
+                    # 改进状态判断：区分未检测、在线、离线三种状态
+                    if last_ping_at == 0:
+                        ping_status = "待检测"
+                        color = Fore.YELLOW
+                    elif last_ping_ok:
+                        ping_status = "在线"
+                        color = Fore.GREEN
+                    else:
+                        ping_status = "离线"
+                        color = Fore.RED
+                    
                     print(f"  {ip}: {color}{ping_status}{Style.RESET_ALL} (最后上报: {last_seen})")
                 logging.info(f"获取到 {len(clients)} 个客户端信息")
                 return clients
@@ -312,6 +456,7 @@ class ClientApp:
                 timeout=5,
                 headers=self._get_headers()
             )
+            self._record_request()  # 记录成功发起的请求
             if response.ok:
                 stats = response.json()
                 print(Fore.CYAN + "服务端统计信息:")
@@ -319,7 +464,7 @@ class ClientApp:
                 print(f"  活跃客户端: {stats.get('active', 0)}")
                 print(f"  在线客户端: {Fore.GREEN}{stats.get('online', 0)}{Style.RESET_ALL}")
                 print(f"  离线客户端: {Fore.RED}{stats.get('offline', 0)}{Style.RESET_ALL}")
-                print(f"  未曾ping过: {stats.get('never_pinged', 0)}")
+                print(f"  待检测客户端: {Fore.YELLOW}{stats.get('never_pinged', 0)}{Style.RESET_ALL}")
                 logging.info(f"获取服务端统计: {stats}")
                 return stats
             else:
@@ -343,6 +488,7 @@ class ClientApp:
                 timeout=5,
                 headers=self._get_headers()
             )
+            self._record_request()  # 记录成功发起的请求
             if response.ok:
                 config = response.json()
                 print(Fore.CYAN + "服务端配置:")
@@ -495,6 +641,53 @@ class ClientApp:
             message = "已清除API密钥"
             print(Fore.YELLOW + message)
             logging.info("清除API密钥")
+
+    def reset_config(self):
+        """重置配置设置"""
+        print("—— 重置配置设置 ——")
+        print("此功能将重置配置文件，您可以选择是否保留用户设置")
+        print()
+        
+        choice = input("是否保留用户设置（目标IP、服务端地址等）？ (Y/n): ").strip().lower()
+        preserve_settings = choice != 'n'
+        
+        confirm_msg = "重置配置" + ("（保留用户设置）" if preserve_settings else "（完全重置）")
+        confirm = input(f"确认{confirm_msg}？ (y/N): ").strip().lower()
+        
+        if confirm != 'y':
+            print(Fore.YELLOW + "已取消重置操作")
+            return
+        
+        try:
+            # 使用common模块中的重置功能
+            from pathlib import Path
+            common_path = Path(__file__).parent.parent / "common"
+            sys.path.insert(0, str(common_path))
+            
+            from common.reset_config import reset_client_config
+            
+            print(f"\n正在{confirm_msg}...")
+            success = reset_client_config(preserve_settings=preserve_settings)
+            
+            if success:
+                print(Fore.GREEN + "配置重置成功！")
+                print("建议重新启动客户端以应用新配置")
+                logging.info(f"用户重置客户端配置，保留设置: {preserve_settings}")
+                
+                # 提示用户是否重新启动
+                restart_choice = input("\n是否现在退出程序以重新启动？ (y/N): ").strip().lower()
+                if restart_choice == 'y':
+                    print("正在退出程序...")
+                    logging.info("用户选择退出以重新启动")
+                    sys.exit(0)
+            else:
+                print(Fore.RED + "配置重置失败，请查看错误信息")
+                logging.error("客户端配置重置失败")
+                
+        except Exception as e:
+            message = f"重置配置时发生错误: {e}"
+            print(Fore.RED + message)
+            logging.error(f"重置配置异常: {e}")
 
     # ---- ZeroTier 管理 ----
     def start_zerotier_service(self):
@@ -761,7 +954,7 @@ class ClientApp:
         """主菜单"""
         while True:
             print("\n" + "="*50)
-            print(Fore.CYAN + Style.BRIGHT + "ZeroTier Solver 客户端")
+            print(Fore.CYAN + Style.BRIGHT + "ZeroTier Reconnecter 客户端")
             print("="*50)
             
             print("配置管理:")
@@ -771,29 +964,31 @@ class ClientApp:
             print("  4) 查看当前配置")
             print("  5) 验证配置")
             print("  6) 配置 ZeroTier 路径")
+            print("  7) 重置配置设置")
             
             print("\nZeroTier 管理:")
-            print("  7) 启动 ZeroTier 服务")
-            print("  8) 停止 ZeroTier 服务")
-            print("  9) 启动 ZeroTier 应用")
-            print("  10) 停止 ZeroTier 应用")
-            print("  11) 执行重启策略")
+            print("  8) 启动 ZeroTier 服务")
+            print("  9) 停止 ZeroTier 服务")
+            print("  10) 启动 ZeroTier 应用")
+            print("  11) 停止 ZeroTier 应用")
+            print("  12) 执行重启策略")
             
             print("\n网络功能:")
-            print("  12) 向服务端上报本机 IP")
-            print("  13) 启动自动治愈")
-            print("  14) 停止自动治愈")
+            print("  13) 向服务端上报本机 IP")
+            print("  14) 启动自动治愈")
+            print("  15) 停止自动治愈")
             
             print("\n服务端交互:")
-            print("  15) 检查服务端健康状态")
-            print("  16) 查看服务端客户端列表")
-            print("  17) 查看服务端统计信息")
-            print("  18) 查看服务端配置")
-            print("  19) 查看服务端状态汇总")
+            print("  16) 启动本地服务端")
+            print("  17) 检查服务端健康状态")
+            print("  18) 查看服务端客户端列表")
+            print("  19) 查看服务端统计信息")
+            print("  20) 查看服务端配置")
+            print("  21) 查看服务端状态汇总")
             
             print("\n状态查看:")
-            print("  20) 查看本地系统状态")
-            print("  21) 查看网络接口信息")
+            print("  22) 查看本地系统状态")
+            print("  23) 查看网络接口信息")
             
             print("\n  0) 退出")
             
@@ -813,34 +1008,38 @@ class ClientApp:
                 elif choice == "6":
                     self.configure_zerotier_paths()
                 elif choice == "7":
-                    self.start_zerotier_service()
+                    self.reset_config()
                 elif choice == "8":
-                    self.stop_zerotier_service()
+                    self.start_zerotier_service()
                 elif choice == "9":
-                    self.start_zerotier_app()
+                    self.stop_zerotier_service()
                 elif choice == "10":
-                    self.stop_zerotier_app()
+                    self.start_zerotier_app()
                 elif choice == "11":
-                    self.restart_strategy()
+                    self.stop_zerotier_app()
                 elif choice == "12":
-                    self.remember_self()
+                    self.restart_strategy()
                 elif choice == "13":
-                    self.start_auto_heal()
+                    self.remember_self()
                 elif choice == "14":
-                    self.stop_auto_heal()
+                    self.start_auto_heal()
                 elif choice == "15":
-                    self.check_server_health()
+                    self.stop_auto_heal()
                 elif choice == "16":
-                    self.get_server_clients()
+                    self.start_local_server()
                 elif choice == "17":
-                    self.get_server_stats()
+                    self.check_server_health()
                 elif choice == "18":
-                    self.get_server_config()
+                    self.get_server_clients()
                 elif choice == "19":
-                    self.show_server_status()
+                    self.get_server_stats()
                 elif choice == "20":
-                    self.show_status()
+                    self.get_server_config()
                 elif choice == "21":
+                    self.show_server_status()
+                elif choice == "22":
+                    self.show_status()
+                elif choice == "23":
                     self.show_network_info()
                 elif choice == "0":
                     message = "正在退出..."
