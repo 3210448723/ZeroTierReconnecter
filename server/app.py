@@ -201,9 +201,11 @@ def save_client_data(force_save: bool = False):
                 # 原子写入：先写临时文件，再移动
                 with open(temp_path, 'w', encoding='utf-8') as f:
                     json.dump(data_snapshot, f, indent=2, ensure_ascii=False)
-                # 确保数据已写入磁盘（在文件仍打开时）
-                f.flush()
-                os.fsync(f.fileno()) if hasattr(os, 'fsync') else None                # 原子性移动操作
+                    # 确保数据已写入磁盘（在文件仍打开时）
+                    f.flush()
+                    if hasattr(os, 'fsync'):
+                        os.fsync(f.fileno())
+                # 原子性移动操作
                 temp_path.replace(data_path)
                 
                 logging.debug(f"成功保存 {len(data_snapshot)} 个客户端数据")
