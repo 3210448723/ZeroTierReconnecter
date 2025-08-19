@@ -1,5 +1,5 @@
 """
-ZeroTier Solver 服务端应用
+ZeroTier Reconnecter 服务端应用
 提供客户端IP监控、ping调度和状态管理功能
 
 主要功能:
@@ -10,13 +10,18 @@ ZeroTier Solver 服务端应用
 - 可选的API认证机制
 """
 
+import atexit
 import json
 import logging
+import os
 import threading
 import time
 import traceback
+import uuid
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -29,7 +34,6 @@ from .ping_scheduler import OptimizedPingScheduler
 from .client_manager import ThreadSafeClientManager
 from .metrics import metrics
 from .config_watcher import HotReloadConfig
-from .log_sanitizer import SanitizedFormatter
 
 # 尝试相对导入，如果失败则使用绝对导入
 try:
@@ -49,13 +53,36 @@ ERROR_SLEEP_SEC = 5.0  # 异常后休眠时间
 MIN_SLEEP_SEC = 0.2  # 最小休眠时间
 MAX_SLEEP_SEC = 2.0  # 最大休眠时间
 
+# === Lifespan事件管理 ===
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理器"""
+    # 启动时的初始化
+    try:
+        initialize_server()
+        logging.info("服务启动成功")
+        yield  # 应用运行期间
+    except Exception as e:
+        logging.error(f"服务启动失败: {e}")
+        logging.error(f"启动异常详情: {traceback.format_exc()}")
+        raise RuntimeError(f"服务启动失败: {e}") from e
+    finally:
+        # 关闭时的清理
+        try:
+            cleanup_server()
+            logging.info("服务关闭成功")
+        except Exception as e:
+            logging.error(f"服务关闭异常: {e}")
+            logging.error(f"关闭异常详情: {traceback.format_exc()}")
+
 # === FastAPI应用初始化 ===
 app = FastAPI(
-    title="ZeroTier Solver Server", 
+    title="ZeroTier Reconnecter Server", 
     version=APP_VERSION,
     description="ZeroTier网络监控和故障自愈服务",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 # === 全局状态 ===
@@ -174,12 +201,9 @@ def save_client_data(force_save: bool = False):
                 # 原子写入：先写临时文件，再移动
                 with open(temp_path, 'w', encoding='utf-8') as f:
                     json.dump(data_snapshot, f, indent=2, ensure_ascii=False)
-                    # 确保数据已写入磁盘（在文件仍打开时）
-                    f.flush()
-                    import os
-                    os.fsync(f.fileno()) if hasattr(os, 'fsync') else None
-                
-                # 原子性移动操作
+                # 确保数据已写入磁盘（在文件仍打开时）
+                f.flush()
+                os.fsync(f.fileno()) if hasattr(os, 'fsync') else None                # 原子性移动操作
                 temp_path.replace(data_path)
                 
                 logging.debug(f"成功保存 {len(data_snapshot)} 个客户端数据")
@@ -378,8 +402,8 @@ def schedule_ping_tasks():
             thread_name_prefix="ping_worker"
         )
     
-    # 同步初始ping间隔
-    last_interval = _update_ping_interval()
+    # 同步初始ping间隔并保存以备后续比较
+    current_interval = _update_ping_interval()
     
     # 初始化时间戳
     last_save_time = time.time()
@@ -392,8 +416,11 @@ def schedule_ping_tasks():
         try:
             current_time = time.time()
             
-            # 检查配置变更
-            last_interval = _update_ping_interval()
+            # 检查配置变更并更新间隔
+            new_interval = _update_ping_interval()
+            if new_interval != current_interval:
+                logging.info(f"Ping间隔已更新: {current_interval} -> {new_interval}秒")
+                current_interval = new_interval
             
             # 定期同步客户端数据到调度器
             if current_time - last_sync_time >= SYNC_INTERVAL_SEC:
@@ -816,8 +843,7 @@ def _rebuild_ping_executor_safely():
                 # 设置合理的超时，避免阻塞太久
                 shutdown_timeout = 15  # 15秒超时
                 
-                # 使用带超时的关闭
-                old_executor.shutdown(wait=False)  # 先标记关闭
+                # 使用带超时的关闭（不再重复调用shutdown）
                 
                 # 循环检查是否关闭完成，带退避机制
                 import time
@@ -873,34 +899,11 @@ def _rebuild_ping_executor_safely():
         shutdown_thread.start()
 
 
-@app.on_event("startup")
-def on_startup():
-    """FastAPI启动事件处理"""
-    try:
-        initialize_server()
-        logging.info("服务启动成功")
-    except Exception as e:
-        logging.error(f"服务启动失败: {e}")
-        logging.error(f"启动异常详情: {traceback.format_exc()}")
-        raise RuntimeError(f"服务启动失败: {e}") from e
-
-
-@app.on_event("shutdown") 
-def on_shutdown():
-    """FastAPI关闭事件处理"""
-    try:
-        cleanup_server()
-        logging.info("服务关闭成功")
-    except Exception as e:
-        logging.error(f"服务关闭异常: {e}")
-        logging.error(f"关闭异常详情: {traceback.format_exc()}")
-
-
 def initialize_server():
     """初始化服务器组件"""
     # 配置日志系统
     setup_logging()
-    logging.info("ZeroTier Solver 服务端启动")
+    logging.info("ZeroTier Reconnecter 服务端启动")
     
     # 验证配置
     errors = config.validate()

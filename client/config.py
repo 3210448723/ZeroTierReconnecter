@@ -30,8 +30,8 @@ class ClientConfig:
     ping_timeout_sec: int = 3          # ping 超时时间（秒）
     
     # 日志配置
-    log_level: str = "INFO"  # DEBUG, INFO, WARNING, ERROR
-    log_file: str = ""       # 空字符串表示仅控制台输出
+    log_level: str = "INFO"            # DEBUG, INFO, WARNING, ERROR  
+    log_file: str = "~/.zerotier_reconnecter_client.log"  # 默认日志文件路径
     
     # 私有属性：用于检测配置变更
     _config_hash: str = ""
@@ -145,7 +145,7 @@ class ClientConfig:
     @staticmethod
     def get_config_path() -> Path:
         """获取配置文件路径"""
-        return Path.home() / ".zerotier_solver_client.json"
+        return Path.home() / ".zerotier_reconnecter_client.json"
 
     @classmethod
     def load(cls) -> "ClientConfig":
@@ -165,6 +165,8 @@ class ClientConfig:
         
         instance = cls()
         instance._config_hash = ""
+        # 保存默认配置到文件
+        instance.save()
         return instance
 
     def save(self) -> bool:
@@ -172,9 +174,10 @@ class ClientConfig:
         try:
             config_path = self.get_config_path()
             
-            # 创建配置数据的副本，排除私有属性
+            # 创建配置数据的副本，排除所有私有属性（以_开头的字段）
             config_dict = asdict(self)
-            config_dict.pop('_config_hash', None)
+            # 过滤掉所有内部字段，避免配置文件污染
+            config_dict = {k: v for k, v in config_dict.items() if not k.startswith('_')}
             
             # 生成新的配置内容和哈希
             new_content = json.dumps(config_dict, indent=2, ensure_ascii=False)

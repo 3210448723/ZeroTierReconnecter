@@ -25,7 +25,7 @@ class AdvancedClient:
     def run(self):
         """运行高级界面"""
         print("=" * 60)
-        print("ZeroTier Solver 高级界面")
+        print("ZeroTier Reconnecter 高级界面")
         print("=" * 60)
         print()
         print("注意：高级双栏界面功能正在开发中")

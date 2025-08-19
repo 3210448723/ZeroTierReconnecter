@@ -20,12 +20,12 @@ class ServerConfig:
     max_concurrent_pings: int = 5      # 最大并发 ping 数量
     
     # 数据保存配置
-    data_file: str = "~/.zerotier_solver_server_data.json"  # 改为与配置文件不同的默认路径
+    data_file: str = "~/.zerotier_reconnecter_server_data.json"  # 改为与配置文件不同的默认路径
     save_interval_sec: int = 30        # 定期保存间隔（秒）
     
     # 日志配置
     log_level: str = "INFO"            # DEBUG, INFO, WARNING, ERROR
-    log_file: str = ""                 # 空字符串表示仅控制台输出
+    log_file: str = "~/.zerotier_reconnecter_server.log"  # 默认日志文件路径
     
     # 客户端管理配置
     client_offline_threshold_sec: int = 300  # 客户端离线判断阈值（秒）
@@ -38,7 +38,7 @@ class ServerConfig:
     def get_config_path() -> Path:
         """获取配置文件路径"""
         # 改为独立的默认配置路径，避免与 data_file 冲突
-        return Path.home() / ".zerotier_solver_server_config.json"
+        return Path.home() / ".zerotier_reconnecter_server_config.json"
 
     @classmethod
     def load(cls) -> "ServerConfig":
@@ -51,7 +51,10 @@ class ServerConfig:
                 return cls(**data)
             except Exception as e:
                 logging.warning(f"加载服务端配置失败: {e}，使用默认配置")
-        return cls()
+        instance = cls()
+        # 保存默认配置到文件
+        instance.save()
+        return instance
 
     def save(self) -> bool:
         """保存配置到文件"""

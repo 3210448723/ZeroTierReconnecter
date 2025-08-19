@@ -37,17 +37,25 @@ def setup_unified_logging(
         # 选择格式化器
         if use_sanitizer:
             try:
-                from ..server.log_sanitizer import SanitizedFormatter
+                # 优先尝试绝对导入
+                try:
+                    from server.log_sanitizer import SanitizedFormatter
+                except ImportError:
+                    # 回退到相对导入
+                    from ..server.log_sanitizer import SanitizedFormatter
+                
                 formatter = SanitizedFormatter(
                     fmt='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S'
                 )
-            except ImportError:
-                # 回退到普通格式化器
+                logging.info("使用脱敏日志格式化器")
+            except ImportError as e:
+                # 脱敏格式化器不可用，回退到普通格式化器
                 formatter = logging.Formatter(
                     fmt='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S'
                 )
+                logging.warning(f"脱敏格式化器不可用，使用普通格式化器: {e}")
         else:
             formatter = logging.Formatter(
                 fmt='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -69,30 +77,29 @@ def setup_unified_logging(
         # 文件处理器（如果配置了）
         if log_file:
             try:
-                # 确保日志文件目录存在
-                log_path = Path(log_file)
+                # 展开用户目录路径并确保日志文件目录存在
+                log_path = Path(log_file).expanduser().resolve()
                 log_dir = log_path.parent
-                if log_dir != Path('.'):  # 避免空字符串导致的问题
-                    log_dir.mkdir(parents=True, exist_ok=True)
+                log_dir.mkdir(parents=True, exist_ok=True)
                 
                 if enable_rotation:
                     # 使用轮转文件处理器
                     from logging.handlers import RotatingFileHandler
                     file_handler = RotatingFileHandler(
-                        log_file, 
+                        str(log_path),  # 使用处理后的路径
                         maxBytes=max_bytes,
                         backupCount=backup_count,
                         encoding='utf-8'
                     )
                     file_handler.setFormatter(formatter)
                     root_logger.addHandler(file_handler)
-                    logging.info(f"日志文件已配置: {log_file} (轮转: {max_bytes//1024//1024}MB × {backup_count}个文件)")
+                    logging.info(f"日志文件已配置: {log_path} (轮转: {max_bytes//1024//1024}MB × {backup_count}个文件)")
                 else:
                     # 普通文件处理器
-                    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+                    file_handler = logging.FileHandler(str(log_path), encoding='utf-8')
                     file_handler.setFormatter(formatter)
                     root_logger.addHandler(file_handler)
-                    logging.info(f"日志文件已配置: {log_file}")
+                    logging.info(f"日志文件已配置: {log_path}")
                     
             except Exception as e:
                 logging.warning(f"无法创建日志文件 {log_file}: {e}")

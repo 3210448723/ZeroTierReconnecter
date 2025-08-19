@@ -179,17 +179,18 @@ class MetricsCollector:
         """导出 Prometheus 格式的指标"""
         system_metrics = self.get_system_metrics()
         app_metrics = self.get_app_metrics(client_manager, executor, offline_threshold_sec)
+        ping_metrics = self.get_ping_metrics()
         
         lines = [
-            "# HELP zerotier_solver_info ZeroTier Solver 应用信息",
-            "# TYPE zerotier_solver_info gauge",
-            f"zerotier_solver_info{{version=\"1.0.0\"}} 1",
+            "# HELP zerotier_reconnecter_info ZeroTier Reconnecter 应用信息",
+            "# TYPE zerotier_reconnecter_info gauge",
+            f"zerotier_reconnecter_info{{version=\"1.0.0\"}} 1",
             "",
         ]
         
         # 系统指标
         for name, value in system_metrics.items():
-            metric_name = f"zerotier_solver_{name}"
+            metric_name = f"zerotier_reconnecter_{name}"
             lines.extend([
                 f"# HELP {metric_name} 系统指标",
                 f"# TYPE {metric_name} gauge",
@@ -199,10 +200,21 @@ class MetricsCollector:
         
         # 应用指标
         for name, value in app_metrics.items():
-            metric_name = f"zerotier_solver_{name}"
+            metric_name = f"zerotier_reconnecter_{name}"
             metric_type = "counter" if ("total" in name or "sum" in name) else "gauge"
             lines.extend([
                 f"# HELP {metric_name} 应用指标", 
+                f"# TYPE {metric_name} {metric_type}",
+                f"{metric_name} {value}",
+                "",
+            ])
+        
+        # Ping指标
+        for name, value in ping_metrics.items():
+            metric_name = f"zerotier_reconnecter_{name}"
+            metric_type = "counter" if ("total" in name) else "gauge"
+            lines.extend([
+                f"# HELP {metric_name} Ping任务指标",
                 f"# TYPE {metric_name} {metric_type}",
                 f"{metric_name} {value}",
                 "",
