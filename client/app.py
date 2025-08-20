@@ -144,11 +144,23 @@ class ClientApp:
                     self._session_request_count = 0
 
     def _ensure_session(self):
-        """确保HTTP会话可用 - 简化版本，加强线程安全"""
-        with self._session_lock:  # 确保线程安全
-            current_time = time.time()
+        """确保HTTP会话可用 - 优化版本，减少锁竞争"""
+        current_time = time.time()
+        
+        # 先进行无锁检查，减少锁竞争
+        should_recreate = (
+            self._session is None or
+            current_time - self._session_created_at > self._session_max_age or
+            self._session_request_count >= self._session_max_requests
+        )
+        
+        if not should_recreate:
+            return
             
-            # 简化判断逻辑：只检查最关键的条件
+        # 只有需要重建时才获取锁
+        with self._session_lock:
+            # 双重检查锁定模式，防止重复重建
+            current_time = time.time()
             should_recreate = (
                 self._session is None or
                 current_time - self._session_created_at > self._session_max_age or
@@ -169,7 +181,18 @@ class ClientApp:
                 if self._session_request_count >= self._session_max_requests:
                     logging.info(f"HTTP会话已处理 {self._session_request_count} 个请求，重建以保持性能")
                 
-                self._init_session()
+                try:
+                    self._init_session()
+                except Exception as e:
+                    logging.error(f"重建HTTP会话失败: {e}")
+                    # 即使重建失败，也要确保有基本的会话可用
+                    if self._session is None:
+                        try:
+                            self._session = requests.Session()
+                            self._session_created_at = time.time()
+                            self._session_request_count = 0
+                        except Exception as fallback_error:
+                            logging.critical(f"创建备用HTTP会话失败: {fallback_error}")
     
     def _record_request(self):
         """记录请求使用（在实际发起请求后调用）"""
@@ -213,7 +236,11 @@ class ClientApp:
         print(f"目标服务端: {self.config.server_base}")
         print()
         
-        self._ensure_session()
+        try:
+            self._ensure_session()
+        except Exception as e:
+            logging.error(f"会话初始化失败: {e}")
+            return False
         
         ips = get_zerotier_ips(self.config)
         if not ips:
@@ -263,6 +290,16 @@ class ClientApp:
                 
                 logging.error(f"上报失败: {response.status_code} {response.text}")
                 return False
+        except requests.exceptions.Timeout as e:
+            message = f"✗ 上报超时: 服务端响应时间过长"
+            self.log_and_print(message, "WARNING", "yellow")
+            logging.warning(f"服务端上报超时: {e}")
+            return False
+        except requests.exceptions.ConnectionError as e:
+            message = f"✗ 上报失败: 无法连接到服务端"
+            self.log_and_print(message, "WARNING", "yellow")
+            logging.warning(f"服务端连接错误: {e}")
+            return False
         except Exception as e:
             message = f"✗ 上报异常: {e}"
             self.log_and_print(message, "ERROR", "red")
@@ -367,7 +404,14 @@ class ClientApp:
         if not silent:
             print("—— 检查服务端健康状态 ——")
         
-        self._ensure_session()
+        try:
+            self._ensure_session()
+        except Exception as e:
+            if not silent:
+                message = f"会话初始化失败: {e}"
+                print(Fore.RED + message)
+                logging.error(message)
+            return False
         
         try:
             response = self._session.get(  # type: ignore  # _ensure_session 确保不为 None
@@ -401,27 +445,35 @@ class ClientApp:
                 message = f"无法连接到服务端: 连接被拒绝"
                 print(Fore.RED + message)
                 logging.error(f"服务端连接错误: {e}")
+            else:
+                logging.debug(f"服务端连接错误: {e}")
             return False
         except requests.exceptions.Timeout as e:
             if not silent:
                 message = f"服务端连接超时"
                 print(Fore.RED + message)
                 logging.error(f"服务端超时: {e}")
+            else:
+                logging.debug(f"服务端超时: {e}")
             return False
         except requests.exceptions.RequestException as e:
             if not silent:
                 message = f"请求服务端时发生错误: {type(e).__name__}"
                 print(Fore.RED + message)
                 logging.error(f"服务端请求错误: {e}")
+            else:
+                logging.debug(f"服务端请求错误: {e}")
             return False
         except (ValueError, KeyError) as e:
             message = f"服务端响应格式错误"
-            print(Fore.RED + message)
+            if not silent:
+                print(Fore.RED + message)
             logging.error(f"服务端响应解析错误: {e}")
             return False
         except Exception as e:
             message = f"检查服务端时发生未知错误: {type(e).__name__}"
-            print(Fore.RED + message)
+            if not silent:
+                print(Fore.RED + message)
             logging.error(f"服务端健康检查未知错误: {e}")
             return False
 
@@ -845,13 +897,25 @@ class ClientApp:
 
     # ---- 自动化功能 ----
     def auto_heal_loop(self):
-        """自动治愈循环 - 增强失败处理和退避机制"""
+        """自动治愈循环 - 修复版本，解决卡死和失败计数问题"""
         cooldown_until = 0.0
         last_status = None
+        consecutive_ping_failures = 0  # 新增：连续ping失败计数
+        last_ping_time = 0.0           # 新增：上次ping时间
+        
+        # 增强的状态跟踪
+        loop_iteration = 0
+        last_log_time = 0.0
         
         while not self._stop_event.is_set():
             try:
                 current_time = time.time()
+                loop_iteration += 1
+                
+                # 每隔5分钟输出一次心跳日志，证明循环还在运行
+                if current_time - last_log_time >= 300:  # 5分钟
+                    logging.info(f"[自动治愈] 心跳检查 (循环 #{loop_iteration}, 失败次数: {self._restart_failure_count})")
+                    last_log_time = current_time
                 
                 # 检查是否设置了目标 IP
                 if not self.config.target_ip:
@@ -872,26 +936,57 @@ class ClientApp:
                     if self._stop_event.wait(timeout=NETWORK_RECOVERY_WAIT_SEC):  # 5分钟
                         break
                     # 等待后重新检测网络状态，如果恢复则重置失败计数
-                    if ping(self.config.target_ip, self.config.ping_timeout_sec):
-                        logging.info("网络已恢复，重置重启失败计数")
-                        self._restart_failure_count = 0
-                        last_status = None  # 重置状态以触发新的状态消息
+                    try:
+                        if ping(self.config.target_ip, self.config.ping_timeout_sec):
+                            logging.info("网络已恢复，重置重启失败计数")
+                            self._restart_failure_count = 0
+                            consecutive_ping_failures = 0  # 同时重置ping失败计数
+                            last_status = None  # 重置状态以触发新的状态消息
+                    except Exception as ping_error:
+                        logging.warning(f"网络恢复检测时出错: {ping_error}")
                     continue
                 
-                # Ping 目标主机
-                reachable = ping(self.config.target_ip, self.config.ping_timeout_sec)
+                # Ping 目标主机（增加异常处理）
+                try:
+                    reachable = ping(self.config.target_ip, self.config.ping_timeout_sec)
+                    last_ping_time = current_time
+                except Exception as ping_error:
+                    logging.warning(f"Ping执行出错: {ping_error}")
+                    reachable = False
+                    
                 status_msg = f"ping {self.config.target_ip}: {'成功' if reachable else '失败'}"
                 
-                if last_status != status_msg:
-                    logging.info(f"[自动治愈] {status_msg}")
-                    if reachable and self._restart_failure_count > 0:
-                        # 网络恢复时重置失败计数
+                # 更新ping失败计数
+                if reachable:
+                    if consecutive_ping_failures > 0:
+                        logging.info(f"Ping恢复成功，重置连续失败计数 ({consecutive_ping_failures} -> 0)")
+                    consecutive_ping_failures = 0
+                    # 网络恢复时重置重启失败计数
+                    if self._restart_failure_count > 0:
                         logging.info(f"网络已恢复，重置重启失败计数 ({self._restart_failure_count} -> 0)")
                         self._restart_failure_count = 0
+                else:
+                    consecutive_ping_failures += 1
+                
+                # 减少日志噪声：只在状态变化或每10次ping失败时记录
+                should_log_status = (
+                    last_status != status_msg or
+                    (not reachable and consecutive_ping_failures % 10 == 0)
+                )
+                
+                if should_log_status:
+                    if not reachable and consecutive_ping_failures > 1:
+                        logging.info(f"[自动治愈] {status_msg} (连续失败 {consecutive_ping_failures} 次)")
+                    else:
+                        logging.info(f"[自动治愈] {status_msg}")
                     last_status = status_msg
                 
                 # 如果不可达且已过冷却期，执行重启策略
-                if not reachable and current_time >= cooldown_until:
+                # 增加条件：必须连续ping失败超过3次才触发重启，避免偶发网络波动
+                if (not reachable and 
+                    consecutive_ping_failures >= 3 and 
+                    current_time >= cooldown_until):
+                    
                     # 计算动态冷却期（安全的指数退避实现）
                     base_cooldown = max(10, self.config.restart_cooldown_sec)
                     
@@ -900,20 +995,35 @@ class ClientApp:
                     exponential_multiplier = min(16, 2 ** safe_exponent)  # 最大16倍（2^4）
                     exponential_backoff = min(MAX_BACKOFF_TIME_SEC, base_cooldown * exponential_multiplier)
                     
-                    logging.warning(f"目标主机 {self.config.target_ip} 不可达，执行重启策略 "
-                                  f"(失败次数: {self._restart_failure_count}, 指数: {safe_exponent}, "
+                    logging.warning(f"目标主机 {self.config.target_ip} 连续 {consecutive_ping_failures} 次不可达，执行重启策略 "
+                                  f"(重启失败次数: {self._restart_failure_count}, 指数: {safe_exponent}, "
                                   f"退避: {exponential_backoff}s)")
                     
-                    restart_success = self.restart_strategy()
+                    restart_success = False
+                    try:
+                        restart_success = self.restart_strategy()
+                    except Exception as restart_error:
+                        logging.error(f"重启策略执行异常: {restart_error}")
+                        self._restart_failure_count += 1
                     
                     # 设置冷却期（使用当前时间 + 退避时间，考虑重启耗时）
                     cooldown_until = time.time() + exponential_backoff
                     
-                    # 重启后尝试上报本机 IP
+                    # 重启后尝试上报本机 IP（增加超时保护）
                     if self._stop_event.wait(timeout=5):
                         break
-                    if restart_success and self.remember_self():
-                        logging.info("重启后成功上报本机 IP")
+                        
+                    if restart_success:
+                        try:
+                            # 给重启一些时间完成
+                            if self._stop_event.wait(timeout=10):
+                                break
+                            # 重启成功后尝试上报
+                            if self.remember_self():
+                                logging.info("重启后成功上报本机 IP")
+                                consecutive_ping_failures = 0  # 重启成功后重置ping失败计数
+                        except Exception as report_error:
+                            logging.warning(f"重启后上报IP失败: {report_error}")
                 
                 # 等待下次检查，使用 Event.wait 响应停止信号
                 wait_time = max(5, self.config.ping_interval_sec)
@@ -925,6 +1035,8 @@ class ClientApp:
                 # 异常时短暂等待，同样响应停止信号
                 if self._stop_event.wait(timeout=10):
                     break
+        
+        logging.info("自动治愈循环已退出")
 
     def start_auto_heal(self):
         """启动自动治愈"""
@@ -948,6 +1060,36 @@ class ClientApp:
         print(Fore.GREEN + message)
         logging.info(message)
 
+    def reset_failure_count(self):
+        """重置自动治愈失败计数"""
+        print("—— 重置自动治愈失败计数 ——")
+        print(f"当前失败计数: {self._restart_failure_count}")
+        print(f"最大允许失败: {self._max_restart_failures}")
+        
+        if self._restart_failure_count == 0:
+            message = "失败计数已经为0，无需重置"
+            print(Fore.YELLOW + message)
+            logging.info(message)
+            return
+        
+        confirm = input("确认重置失败计数？ (y/N): ").strip().lower()
+        if confirm != 'y':
+            print(Fore.YELLOW + "已取消重置操作")
+            return
+        
+        old_count = self._restart_failure_count
+        self._restart_failure_count = 0
+        
+        message = f"已重置失败计数: {old_count} -> 0"
+        print(Fore.GREEN + message)
+        logging.info(f"用户手动重置自动治愈失败计数: {old_count} -> 0")
+        
+        # 如果自动治愈正在运行，提示用户
+        if self._bg_thread and self._bg_thread.is_alive():
+            print(Fore.GREEN + "自动治愈将继续正常工作")
+        else:
+            print(Fore.YELLOW + "请启动自动治愈以使重置生效 (选项14)")
+
     def stop_auto_heal(self):
         """停止自动治愈"""
         self._stop_event.set()
@@ -966,6 +1108,98 @@ class ClientApp:
         self.stop_auto_heal()
         self._cleanup_session()
 
+    def debug_auto_heal(self):
+        """调试自动治愈状态 - 详细诊断信息"""
+        print("—— 自动治愈调试信息 ——")
+        
+        # 基本状态
+        is_running = self._bg_thread and self._bg_thread.is_alive()
+        print(f"自动治愈状态: {'运行中' if is_running else '已停止'}")
+        print(f"配置启用状态: {'启用' if self.config.auto_heal_enabled else '禁用'}")
+        
+        if self._bg_thread:
+            print(f"后台线程ID: {self._bg_thread.ident}")
+            print(f"线程存活状态: {self._bg_thread.is_alive()}")
+            print(f"线程是否为守护线程: {self._bg_thread.daemon}")
+        else:
+            print("后台线程: 未创建")
+        
+        # 停止事件状态
+        print(f"停止信号状态: {'已设置' if self._stop_event.is_set() else '未设置'}")
+        
+        # 失败计数器状态
+        print(f"重启失败计数: {self._restart_failure_count}/{self._max_restart_failures}")
+        if self._restart_failure_count >= self._max_restart_failures:
+            print(Fore.RED + "  ⚠️ 已达到最大失败次数，自动治愈已暂停")
+        
+        # 配置检查
+        print(f"目标IP设置: {self.config.target_ip or '未设置'}")
+        if not self.config.target_ip:
+            print(Fore.YELLOW + "  ⚠️ 未设置目标IP，自动治愈无法工作")
+        
+        print(f"Ping间隔: {self.config.ping_interval_sec} 秒")
+        print(f"Ping超时: {self.config.ping_timeout_sec} 秒")
+        print(f"重启冷却: {self.config.restart_cooldown_sec} 秒")
+        
+        # 网络连通性测试
+        if self.config.target_ip:
+            print(f"\n正在测试目标主机连通性...")
+            try:
+                start_time = time.time()
+                reachable = ping(self.config.target_ip, self.config.ping_timeout_sec)
+                ping_time = (time.time() - start_time) * 1000
+                
+                if reachable:
+                    print(f"{Fore.GREEN}✓ 目标主机可达 (用时: {ping_time:.1f}ms)")
+                else:
+                    print(f"{Fore.RED}✗ 目标主机不可达 (用时: {ping_time:.1f}ms)")
+                    print("  这可能是自动治愈停止工作的原因")
+            except Exception as e:
+                print(f"{Fore.RED}✗ Ping测试异常: {e}")
+        
+        # 服务端连接测试
+        print(f"\n正在测试服务端连接...")
+        try:
+            start_time = time.time()
+            health_ok = self.check_server_health(silent=True)
+            api_time = (time.time() - start_time) * 1000
+            
+            if health_ok:
+                print(f"{Fore.GREEN}✓ 服务端连接正常 (用时: {api_time:.1f}ms)")
+            else:
+                print(f"{Fore.RED}✗ 服务端连接失败 (用时: {api_time:.1f}ms)")
+        except Exception as e:
+            print(f"{Fore.RED}✗ 服务端测试异常: {e}")
+        
+        # HTTP会话状态
+        with self._session_lock:
+            if self._session:
+                session_age = time.time() - self._session_created_at
+                print(f"\nHTTP会话状态: 正常")
+                print(f"  会话存活时间: {session_age:.0f} 秒")
+                print(f"  已处理请求: {self._session_request_count}")
+                print(f"  最大请求数: {self._session_max_requests}")
+                print(f"  最大存活时间: {self._session_max_age} 秒")
+            else:
+                print(f"\n{Fore.YELLOW}HTTP会话状态: 未初始化")
+        
+        # 建议和排查步骤
+        print(f"\n{Fore.CYAN}排查建议:")
+        if not self.config.auto_heal_enabled:
+            print(f"  1. 自动治愈在配置中被禁用，请检查配置")
+        if not self.config.target_ip:
+            print(f"  2. 请先设置目标IP (选项1)")
+        if not is_running and self.config.auto_heal_enabled and self.config.target_ip:
+            print(f"  3. 尝试重新启动自动治愈 (选项14)")
+        if self._restart_failure_count >= self._max_restart_failures:
+            print(f"  4. 重启失败次数过多，等待网络恢复或手动重置失败计数")
+            print(f"     可以尝试停止后重新启动自动治愈来重置计数")
+        
+        print(f"  5. 检查日志文件: {self.config.log_file}")
+        print(f"  6. 确保ZeroTier服务正常运行")
+        
+        logging.info("用户查看自动治愈调试信息")
+
     # ---- 状态查看 ----
     def show_status(self):
         """显示系统状态"""
@@ -979,10 +1213,13 @@ class ClientApp:
         
         # 网络状态
         if self.config.target_ip:
-            reachable = ping(self.config.target_ip, self.config.ping_timeout_sec)
-            status_color = Fore.GREEN if reachable else Fore.RED
-            status_text = "可达" if reachable else "不可达"
-            print(f"目标主机 ({self.config.target_ip}): {status_color}{status_text}")
+            try:
+                reachable = ping(self.config.target_ip, self.config.ping_timeout_sec)
+                status_color = Fore.GREEN if reachable else Fore.RED
+                status_text = "可达" if reachable else "不可达"
+                print(f"目标主机 ({self.config.target_ip}): {status_color}{status_text}")
+            except Exception as e:
+                print(f"目标主机 ({self.config.target_ip}): {Fore.YELLOW}检测异常 ({e})")
         else:
             print("目标主机: 未设置")
         
@@ -993,9 +1230,28 @@ class ClientApp:
         else:
             print("本机 ZeroTier IP: 未找到")
         
-        # 自动化状态
+        # 自动化状态（增强诊断信息）
         auto_status = "运行中" if (self._bg_thread and self._bg_thread.is_alive()) else "已停止"
         print(f"自动治愈: {auto_status}")
+        
+        if auto_status == "运行中":
+            print(f"  - 重启失败次数: {self._restart_failure_count}/{self._max_restart_failures}")
+            print(f"  - 配置启用状态: {'启用' if self.config.auto_heal_enabled else '禁用'}")
+            print(f"  - Ping 间隔: {self.config.ping_interval_sec} 秒")
+            print(f"  - 重启冷却: {self.config.restart_cooldown_sec} 秒")
+            
+            # 显示线程状态
+            if self._bg_thread:
+                print(f"  - 线程状态: {'活跃' if self._bg_thread.is_alive() else '已终止'}")
+                print(f"  - 线程ID: {self._bg_thread.ident}")
+        
+        # HTTP会话状态
+        with self._session_lock:
+            if self._session:
+                session_age = time.time() - self._session_created_at
+                print(f"HTTP会话: 正常 (存活: {session_age:.0f}s, 请求数: {self._session_request_count})")
+            else:
+                print("HTTP会话: 未初始化")
         
         logging.info("用户查看系统状态")
 
@@ -1055,18 +1311,20 @@ class ClientApp:
             print("  13) 向服务端上报本机 IP")
             print("  14) 启动自动治愈")
             print("  15) 停止自动治愈")
+            print("  16) 重置自动治愈失败计数")
             
             print("\n服务端交互:")
-            print("  16) 启动本地服务端")
-            print("  17) 检查服务端健康状态")
-            print("  18) 查看服务端客户端列表")
-            print("  19) 查看服务端统计信息")
-            print("  20) 查看服务端配置")
-            print("  21) 查看服务端状态汇总")
+            print("  17) 启动本地服务端")
+            print("  18) 检查服务端健康状态")
+            print("  19) 查看服务端客户端列表")
+            print("  20) 查看服务端统计信息")
+            print("  21) 查看服务端配置")
+            print("  22) 查看服务端状态汇总")
             
             print("\n状态查看:")
-            print("  22) 查看本地系统状态")
-            print("  23) 查看网络接口信息")
+            print("  23) 查看本地系统状态")
+            print("  24) 查看网络接口信息")
+            print("  25) 调试自动治愈状态")
             
             print("\n  0) 退出")
             
@@ -1104,21 +1362,25 @@ class ClientApp:
                 elif choice == "15":
                     self.stop_auto_heal()
                 elif choice == "16":
-                    self.start_local_server()
+                    self.reset_failure_count()
                 elif choice == "17":
-                    self.check_server_health()
+                    self.start_local_server()
                 elif choice == "18":
-                    self.get_server_clients()
+                    self.check_server_health()
                 elif choice == "19":
-                    self.get_server_stats()
+                    self.get_server_clients()
                 elif choice == "20":
-                    self.get_server_config()
+                    self.get_server_stats()
                 elif choice == "21":
-                    self.show_server_status()
+                    self.get_server_config()
                 elif choice == "22":
-                    self.show_status()
+                    self.show_server_status()
                 elif choice == "23":
+                    self.show_status()
+                elif choice == "24":
                     self.show_network_info()
+                elif choice == "25":
+                    self.debug_auto_heal()
                 elif choice == "0":
                     message = "正在退出..."
                     print(message)
